@@ -118,8 +118,8 @@ def ellipse_poly(cx, cy, a, b, angle_deg, n=200):
 
 
 # ========= UI =========
-st.set_page_config(page_title="Sensor Coverage — Cone ∩ Floor", layout="wide")
-st.title("Sensor Coverage — Cone ∩ Floor")
+st.set_page_config(page_title="QUMEA Sensor Coverage — Floor Coverage", layout="wide")
+st.title("QUMEA Sensor Coverage — Floor Coverage")
 
 # --- Defaults (copied from your script) ---
 DEFAULTS = dict(
