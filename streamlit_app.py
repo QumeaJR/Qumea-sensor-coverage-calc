@@ -40,14 +40,16 @@ def ellipse_from_cone(h, fov_deg, tilt_deg, yaw_deg=0.0):
     angle_deg = np.degrees(np.arctan2(evecs[1, 0], evecs[0, 0]))
     return xc, (axes[0], axes[1]), angle_deg
 
+@st.cache_data
+def _ellipse_from_cone_cached(h, fov_deg, tilt_deg, yaw_deg):
+    return ellipse_from_cone(h, fov_deg, tilt_deg, yaw_deg)
+    
 
 def compute_sensor(sensorX, sensorY, height, min_side, fov, tilt, yaw, name):
     # --- robust min_side (avoid 0 or >= height) ---
-    print(f"height {float(height)}, min_side{float(min_side)}")
     ms = float(min_side)
     eps = 1e-6
     ms = max(eps, min(ms, float(height) - eps))  # clamp into (0, height)
-    print(f"height {float(height)}, min_side{float(min_side)}")
     alpha = fov / 2.0
     h = float(height) - ms
     if (alpha + tilt) >= 89.9:
@@ -58,13 +60,16 @@ def compute_sensor(sensorX, sensorY, height, min_side, fov, tilt, yaw, name):
     rightFloor = h * np.tan(np.deg2rad(alpha + tilt))
 
     # Exact ellipse via quadric ∩ plane
-    (cx, cy), (a, b), angle_deg = ellipse_from_cone(h=h, fov_deg=fov, tilt_deg=tilt, yaw_deg=yaw)
+    #(cx, cy), (a, b), angle_deg = ellipse_from_cone(h=h, fov_deg=fov, tilt_deg=tilt, yaw_deg=yaw)
+    (cx, cy), (a, b), angle_deg = _ellipse_from_cone_cached(h, fov, tilt, yaw)
     cx_w = sensorX + cx
     cy_w = sensorY + cy
 
-    r0 = np.hypot(sensorX, sensorY)
-    ellipse_start = r0 - leftFloor
-    ellipse_end   = ellipse_start + (leftFloor + rightFloor)
+    #r0 = np.hypot(sensorX, sensorY)
+    #ellipse_start = r0 - leftFloor
+    #ellipse_end   = ellipse_start + (leftFloor + rightFloor)
+    ellipse_start = -leftFloor   # negative = “behind” along the tilt axis
+    ellipse_end   =  rightFloor  # positive = “forward” along the tilt axis
     center_view   = height * np.tan(np.deg2rad(tilt))
 
     return dict(
@@ -92,6 +97,9 @@ def ellipse_poly(cx, cy, a, b, angle_deg, n=200):
     pts = R @ np.vstack([a*np.cos(t), b*np.sin(t)])
     return cx + pts[0], cy + pts[1]
 
+@st.cache_data
+def _ellipse_poly_cached(cx, cy, a, b, angle_deg, n):
+    return ellipse_poly(cx, cy, a, b, angle_deg, n)
 
 # ------------- App config -------------
 st.set_page_config(page_title="QUMEA Sensor Coverage — Floor Coverage", layout="wide")
@@ -258,42 +266,171 @@ with st.expander("Side-view metrics", expanded=False):
     st.dataframe(df_side, use_container_width=True)
 
 # ------------- Downloads -------------
-col_dl1, col_dl2, _ = st.columns([1, 1, 3])
-col_dl1.download_button(
-    "Download dimensions (CSV)",
-    df_dim.to_csv(index=True).encode(),
-    file_name="ellipse_dimensions.csv",
-    mime="text/csv",
-)
+# ---- DXF export helpers (multi-ellipse, units, version) ----
+def dxf_export_bytes(
+    ellipses,
+    *,
+    as_poly=False,
+    n=360,
+    units="m",                # "m" or "mm"
+    dxf_version="R2010",
+    add_crosshair=False,
+    sensor=None,              # (sensorX, sensorY) in meters
+    crosshair_size=0.2,       # in *selected* units (m or mm)
+):
+    """
+    Build a DXF containing one or more ellipses and (optionally) a sensor crosshair.
+    ellipses: list of dicts {name, cx, cy, a, b, angle_deg} (in meters).
+    """
+    try:
+        import ezdxf
+    except Exception as e:
+        raise RuntimeError("DXF export requires 'ezdxf'. Install: pip install ezdxf") from e
 
-with st.expander("Download footprint polygons (CSV)", expanded=False):
-    x0, y0 = ellipse_poly(base["cx"], base["cy"], base["a"], base["b"], base["angle_deg"], n=npts)
-    x1, y1 = ellipse_poly(til["cx"],  til["cy"],  til["a"],  til["b"],  til["angle_deg"],  n=npts)
+    import io
+    # Units + scale
+    scale = 1000.0 if units == "mm" else 1.0
+    insunits = 4 if units == "mm" else 6  # 4=mm, 6=m
+
+    doc = ezdxf.new(dxf_version)
+    doc.header["$INSUNITS"] = insunits
+    msp = doc.modelspace()
+
+    # Ensure layers exist
+    def ensure_layer(name, color=None):
+        if name not in doc.layers:
+            if color is None:
+                doc.layers.new(name=name)
+            else:
+                doc.layers.new(name=name, dxfattribs={"color": color})
+
+    # Ellipses
+    for e in ellipses:
+        cx = float(e["cx"]) * scale
+        cy = float(e["cy"]) * scale
+        a  = float(e["a"])  * scale
+        b  = float(e["b"])  * scale
+        ang = float(e["angle_deg"])
+        layer = f"{e.get('name','ELLIPSE').upper()}"
+        ensure_layer(layer)
+
+        if not as_poly:
+            if a <= 0 or b <= 0:
+                raise ValueError(f"Ellipse '{layer}': axes must be positive.")
+            theta = np.deg2rad(ang)
+            major_axis = (a*np.cos(theta), a*np.sin(theta), 0.0)  # vector
+            ratio = b / a
+            msp.add_ellipse(center=(cx, cy, 0.0), major_axis=major_axis, ratio=ratio,
+                            dxfattribs={"layer": layer})
+        else:
+            x, y = ellipse_poly(cx, cy, a, b, ang, n=n)
+            msp.add_lwpolyline(list(zip(x, y)), format="xy", close=True,
+                               dxfattribs={"layer": layer})
+
+    # Optional sensor crosshair
+    if add_crosshair and sensor is not None:
+        sx = float(sensor[0]) * scale
+        sy = float(sensor[1]) * scale
+        size = float(crosshair_size)              # already in chosen units
+        ensure_layer("SENSOR", color=1)           # red
+        # horizontal + vertical lines
+        msp.add_line((sx - size, sy, 0.0), (sx + size, sy, 0.0), dxfattribs={"layer": "SENSOR"})
+        msp.add_line((sx, sy - size, 0.0), (sx, sy + size, 0.0), dxfattribs={"layer": "SENSOR"})
+        # small circle for visibility
+        msp.add_circle(center=(sx, sy, 0.0), radius=size * 0.6, dxfattribs={"layer": "SENSOR"})
+
+    buf = io.StringIO()
+    doc.write(buf)
+    return buf.getvalue().encode("utf-8")
+
+
+
+
+with st.expander("Downloads", expanded=False):
+    #x0, y0 = ellipse_poly(base["cx"], base["cy"], base["a"], base["b"], base["angle_deg"], n=npts)
+    x0, y0 = _ellipse_poly_cached(base["cx"], base["cy"], base["a"], base["b"], base["angle_deg"], n=npts)
+    #x1, y1 = ellipse_poly(til["cx"],  til["cy"],  til["a"],  til["b"],  til["angle_deg"],  n=npts)
+    x1, y1 = _ellipse_poly_cached(til["cx"],  til["cy"],  til["a"],  til["b"],  til["angle_deg"],  n=npts)
     df_poly = pd.DataFrame({
         "name": ["non-tilted"]*len(x0) + ["tilted"]*len(x1),
         "x":    np.concatenate([x0, x1]),
         "y":    np.concatenate([y0, y1]),
         "seq":  np.concatenate([np.arange(len(x0)), np.arange(len(x1))]),
     })
-    st.download_button(
+    
+    col_dl1, col_dl2, col_dl3 = st.columns([1, 1, 3])
+    col_dl1.download_button(
+        "Download dimensions (CSV)",
+        df_dim.to_csv(index=True).encode(),
+        file_name="ellipse_dimensions.csv",
+        mime="text/csv",
+    )
+
+    export = {
+        "inputs": dict(height=height, fov=fov, tilt=tilt, yaw=yaw,
+                       sensorX=sensorX, sensorY=sensorY, min_side=min_side, npts=npts),
+        "non_tilted": base,
+        "tilted": til,
+    }
+    col_dl2.download_button(
+        "Download JSON (inputs + outputs)",
+        data=json.dumps(export, indent=2).encode(),
+        file_name="sensor_coverage.json",
+        mime="application/json",
+    )
+
+    col_dl3.download_button(
         "Download polygons CSV",
         df_poly.to_csv(index=False).encode(),
         file_name="footprints.csv",
         mime="text/csv",
     )
 
-export = {
-    "inputs": dict(height=height, fov=fov, tilt=tilt, yaw=yaw,
-                   sensorX=sensorX, sensorY=sensorY, min_side=min_side, npts=npts),
-    "non_tilted": base,
-    "tilted": til,
-}
-col_dl2.download_button(
-    "Download JSON (inputs + outputs)",
-    data=json.dumps(export, indent=2).encode(),
-    file_name="sensor_coverage.json",
-    mime="application/json",
-)
+with st.expander("Download CAD (DXF)", expanded=False):
+    cols = st.columns([1,1,1,1])
+    as_poly        = cols[0].checkbox("Use polyline", value=False)
+    units          = cols[1].selectbox("Units", ["m","mm"], index=0)
+    dxf_version    = cols[2].selectbox("DXF version", ["R2010","R2000"], index=0)
+    include_base   = cols[3].checkbox("Include non-tilted", value=False)
+    n_poly         = st.slider("Polyline points", 64, 720, 256, 32, disabled=not as_poly)
+
+    add_crosshair  = st.checkbox("Add sensor crosshair", value=True)
+    # size is in the selected units; choose a sensible default
+    default_size = 0.2 if units == "m" else 200.0
+    cross_size = st.number_input(
+        f"Crosshair size [{units}]",
+        min_value=0.01 if units == "m" else 1.0,
+        value=default_size,
+        step=0.01 if units == "m" else 10.0,
+    )
+
+    ellipses = [
+        {"name":"tilted", "cx":til["cx"], "cy":til["cy"], "a":til["a"], "b":til["b"], "angle_deg":til["angle_deg"]}
+    ]
+    if include_base:
+        ellipses.insert(0, {"name":"non_tilted", "cx":base["cx"], "cy":base["cy"],
+                            "a":base["a"], "b":base["b"], "angle_deg":base["angle_deg"]})
+
+    try:
+        dxf_bytes = dxf_export_bytes(
+            ellipses,
+            as_poly=as_poly,
+            n=n_poly,
+            units=units,
+            dxf_version=dxf_version,
+            add_crosshair=add_crosshair,
+            sensor=(sensorX, sensorY),
+            crosshair_size=cross_size,
+        )
+        fn = f"ellipse_{'both' if include_base else 'tilted'}_{units}.dxf"
+        st.download_button("Download DXF", data=dxf_bytes, file_name=fn, mime="application/dxf")
+    except (RuntimeError, ValueError) as e:
+        st.info(str(e))
+
+
+
+
+
 
 # ------------- Plots -------------
 def side_view_figure():
@@ -359,7 +496,8 @@ def top_view_figure():
     fig = go.Figure()
     colors = {"non-tilted": "#3b82f6", "tilted": "#22c55e"}
 
-    x0, y0 = ellipse_poly(base["cx"], base["cy"], base["a"], base["b"], base["angle_deg"], n=npts)
+    #x0, y0 = ellipse_poly(base["cx"], base["cy"], base["a"], base["b"], base["angle_deg"], n=npts)
+    x0, y0 = _ellipse_poly_cached(base["cx"], base["cy"], base["a"], base["b"], base["angle_deg"], n=npts)
     fig.add_trace(go.Scatter(
         x=x0, y=y0, mode="lines", fill="toself",
         name="non-tilted footprint",
@@ -367,7 +505,8 @@ def top_view_figure():
         fillcolor="rgba(59,130,246,0.15)"
     ))
 
-    x1, y1 = ellipse_poly(til["cx"], til["cy"], til["a"], til["b"], til["angle_deg"], n=npts)
+    #x1, y1 = ellipse_poly(til["cx"], til["cy"], til["a"], til["b"], til["angle_deg"], n=npts)
+    x1, y1 = _ellipse_poly_cached(til["cx"], til["cy"], til["a"], til["b"], til["angle_deg"], n=npts)
     fig.add_trace(go.Scatter(
         x=x1, y=y1, mode="lines", fill="toself",
         name="tilted footprint",
@@ -384,6 +523,14 @@ def top_view_figure():
         x=[xs, xe], y=[ys, ye], mode="lines",
         line=dict(width=2, color="#10b981"),
         name="tilt axis span"
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=[sensorX], y=[sensorY],
+        mode="markers+text",
+        text=["sensor"], textposition="top center",
+        marker=dict(size=8),
+        name="sensor"
     ))
 
     fig.update_xaxes(title_text="X [m]")
